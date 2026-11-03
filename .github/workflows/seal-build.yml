@@ -1,0 +1,123 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'go test package pattern/flags to run; empty runs the full suite'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: false
+      - name: Build module zip helper
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" golang.org/x/sys v0.30.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.30.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.30.0.zip" | tail -n 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.30.0.zip
+          if-no-files-found: error
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      # Upstream's Go builders (LUCI) set GO_BUILDER_NAME; windows/svc and
+      # windows/svc/mgr skip their service-install tests without it. The GHA
+      # runner is an ephemeral admin VM, so modifying services is safe here.
+      GO_BUILDER_NAME: seal-gha-${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: false
+      - name: Bluetooth environment (windows)
+        # windows TestWSALookupService queries the Bluetooth namespace (NS_BTH)
+        # and skips with WSASERVICE_NOT_FOUND when the host has no Bluetooth
+        # radio. Start the Bluetooth Support Service if the image has it and
+        # record the adapter state, so the log shows why that test can or
+        # cannot run on this runner.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $svc = Get-Service -Name bthserv -ErrorAction SilentlyContinue
+          if ($svc) {
+            Write-Host "bthserv present, status: $($svc.Status)"
+            if ($svc.Status -ne 'Running') {
+              try {
+                Set-Service -Name bthserv -StartupType Manual
+                Start-Service -Name bthserv
+              } catch {
+                Write-Host "bthserv could not be started: $($_.Exception.Message)"
+              }
+              Write-Host "bthserv status now: $((Get-Service bthserv).Status)"
+            }
+          } else {
+            Write-Host "Bluetooth Support Service (bthserv) is not installed on this runner image"
+          }
+          $bt = Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue
+          if ($bt) { $bt | Format-Table -AutoSize | Out-String | Write-Host }
+          else { Write-Host "No Bluetooth adapter (PnP class Bluetooth) present: hosted runner VM has no Bluetooth radio, so NS_BTH lookups return WSASERVICE_NOT_FOUND" }
+      - name: Build
+        run: |
+          set -eux
+          go version
+          go build ./...
+      - name: Test
+        run: |
+          set -eux
+          go test -v ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+      - name: Test summary
+        run: |
+          set -eu
+          LOG="$RUNNER_TEMP/go-test.log"
+          awk '
+            /^ok[ \t]/ { pok++ }
+            /^FAIL[ \t]/ { pfail++ }
+            /^[ \t]*--- PASS:/ { pass++ }
+            /^[ \t]*--- FAIL:/ { fail++ }
+            /^[ \t]*--- SKIP:/ { skip++; skipped[skip] = $0 " -- reason: " prev }
+            /^(ok|FAIL|\?)[ \t]/ { print }
+            { prev = $0 }
+            END {
+              for (i = 1; i <= skip; i++) print "SKIPPED " skipped[i]
+              printf "packages ok: %d, packages FAIL: %d\n", pok, pfail
+              printf "tests passed: %d, tests failed: %d, tests skipped: %d\n", pass, fail, skip
+            }
+          ' "$LOG"
