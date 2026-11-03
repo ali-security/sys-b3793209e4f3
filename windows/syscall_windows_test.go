@@ -10,6 +10,7 @@ import (
 	"debug/pe"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1471,5 +1472,41 @@ func TestToUnicodeEx(t *testing.T) {
 	}
 	if err := windows.UnloadKeyboardLayout(araLayout); err != nil {
 		t.Errorf("UnloadKeyboardLayout failed: %v", err)
+	}
+}
+
+func TestRoundtripNTUnicodeString(t *testing.T) {
+	// NTUnicodeString maximum string length must fit in a uint16, less for terminal NUL.
+	maxString := strings.Repeat("*", (math.MaxUint16/2)-1)
+	for _, test := range []struct {
+		s       string
+		wantErr bool
+	}{{
+		s: "",
+	}, {
+		s: "hello",
+	}, {
+		s: "Ƀ",
+	}, {
+		s: maxString,
+	}, {
+		s:       maxString + "*",
+		wantErr: true,
+	}, {
+		s:       "a\x00a",
+		wantErr: true,
+	}} {
+		ntus, err := windows.NewNTUnicodeString(test.s)
+		if (err != nil) != test.wantErr {
+			t.Errorf("NewNTUnicodeString(%q): %v, wantErr:%v", test.s, err, test.wantErr)
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		s2 := ntus.String()
+		if test.s != s2 {
+			t.Errorf("round trip of %q = %q, wanted original", test.s, s2)
+		}
 	}
 }
